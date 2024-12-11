@@ -27,8 +27,14 @@ class SimpleSwitch13REST(app_manager.RyuApp):
     PORT_SCAN_WINDOW = 10     # 10 seconds
 
     # DoS detection parameters
-    DOS_THRESHOLD = 100       # More than 100 SYN packets in the window triggers a DOS alert
-    DOS_WINDOW = 5            # 5 seconds window
+    DOS_THRESHOLD_PACKETS = 10000  # Example: 10,000 packets in a time window
+    DOS_THRESHOLD_BYTES = 1000000  # Example: 1,000,000 bytes in a time window
+    DOS_WINDOW = 10  # 10 seconds time window          # 5 seconds window
+    
+    # Create a priority indicator for SYN TCP packets and a normal one
+    SYN_PRIORITY = 3
+    CATCH_TCP_PRIORITY = 2
+    NORMAL_PRIORITY = 1
 
     _CONTEXTS = {
         'wsgi': WSGIApplication
@@ -125,6 +131,7 @@ class SimpleSwitch13REST(app_manager.RyuApp):
         self.logger.warning("Blocking host %s due to detected attack", src_ip)
         parser = datapath.ofproto_parser
         match = parser.OFPMatch(eth_type=0x0800, ipv4_src=src_ip)
+        self.blocked_hosts.add(src_ip)
         # No actions => Drop
         actions = []
         # A high priority flow to drop all packets from this IP
@@ -173,16 +180,55 @@ class SimpleSwitch13REST(app_manager.RyuApp):
         """
         dpid = ev.msg.datapath.id
         body = ev.msg.body
+        now = time.time()
         flows = []
+
         for stat in body:
             flow_info = {
                 "match": str(stat.match),
+                "priority": stat.priority,
                 "packet_count": stat.packet_count,
                 "byte_count": stat.byte_count,
                 "duration_sec": stat.duration_sec,
                 "duration_nsec": stat.duration_nsec
             }
             flows.append(flow_info)
+            
+            src_ip = stat.match.get('ipv4_src')  # Source IP
+            if not src_ip or stat.priority != self.SYN_PRIORITY:
+                continue  # Skip if no source IP in the match or if it's not a SYN
+            
+            if src_ip not in self.blocked_hosts:
+                # Retrieve packet and byte counts
+                packet_count = stat.packet_count
+                byte_count = stat.byte_count
+
+                # Update the DoS tracker
+                record = self.dos_tracker.get(src_ip, {'packets': 0, 'bytes': 0, 'start_time': now})
+                if now - record['start_time'] > self.DOS_WINDOW:
+                    # Reset tracking for the IP if outside the time window
+                    record = {'packets': 0, 'bytes': 0, 'start_time': now}
+
+                # Accumulate packets and bytes
+                record['packets'] += packet_count
+                record['bytes'] += byte_count
+                self.dos_tracker[src_ip] = record
+
+                # Detect DoS based on thresholds
+                if record['packets'] > self.DOS_THRESHOLD_PACKETS or record['bytes'] > self.DOS_THRESHOLD_BYTES:
+                    self.logger.warning("DoS detected from IP %s on Datapath %s!", src_ip, dpid)
+                    self.block_host(self.datapaths[dpid], src_ip)
+
+                    self.dos_alert_count += 1
+                    self.dos_events.append({
+                        "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
+                        "src_ip": src_ip
+                    })
+                
+                dst_port = stat.match.get("tcp_dst", "unknown")
+                if(dst_port):
+                    self.detect_port_scan(dpid, src_ip, dst_port)
+            
         self.flow_stats_data[dpid] = flows
 
     @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
@@ -239,6 +285,51 @@ class SimpleSwitch13REST(app_manager.RyuApp):
         # Just forward as a learning switch for now
         actions = [parser.OFPActionOutput(out_port)]
 
+	    # Add a flow rule for known destinations
+        if out_port != datapath.ofproto.OFPP_FLOOD:
+            ip_pkt = pkt.get_protocol(ipv4.ipv4)
+            tcp_pkt = pkt.get_protocol(tcp.tcp)
+
+            if(ip_pkt and tcp_pkt):
+                # Normal traffic rule
+                match_normal = parser.OFPMatch(
+                    eth_type=0x0800,  # IPv4
+                    ip_proto=6,       # TCP
+                    ipv4_src=ip_pkt.src,
+                    ipv4_dst=ip_pkt.dst
+                )
+                actions_normal = [parser.OFPActionOutput(out_port)]
+                self.add_flow(datapath, self.NORMAL_PRIORITY, match_normal, actions_normal)
+
+                # TCP SYN traffic rule
+                if tcp_pkt.bits & tcp.TCP_SYN:
+                    match_syn = parser.OFPMatch(
+                        eth_type=0x0800,  # IPv4
+                        ip_proto=6,       # TCP
+                        ipv4_src=ip_pkt.src,
+                        ipv4_dst=ip_pkt.dst,
+                        tcp_flags=tcp.TCP_SYN,
+                        tcp_dst=tcp_pkt.dst_port
+                    )
+                    actions_syn = [parser.OFPActionOutput(out_port)]
+                    self.add_flow(datapath, self.SYN_PRIORITY, match_syn, actions_syn)
+            else:
+                match_no_tcp = datapath.ofproto_parser.OFPMatch(
+                    in_port=in_port, eth_src=src, eth_dst=dst
+                )
+                match_tcp = datapath.ofproto_parser.OFPMatch(
+                    in_port=in_port, 
+                    eth_src=src, 
+                    eth_dst=dst, 
+                    eth_type=0x0800,  # IPv4
+                    ip_proto=6,       # TCP
+                )
+                send_to_ctrl_action = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
+                                          ofproto.OFPCML_NO_BUFFER)]
+                self.add_flow(datapath, self.CATCH_TCP_PRIORITY, match_tcp, send_to_ctrl_action)
+                self.add_flow(datapath, self.NORMAL_PRIORITY, match_no_tcp, actions)
+        
+            
         # Extract IP/TCP/UDP for detection
         ip_pkt = pkt.get_protocol(ipv4.ipv4)
         if ip_pkt and ip_pkt.src not in self.blocked_hosts:
@@ -250,10 +341,6 @@ class SimpleSwitch13REST(app_manager.RyuApp):
             is_syn = False
             if tcp_pkt and (tcp_pkt.bits & tcp.TCP_SYN):
                 is_syn = True
-
-            # Detect DoS only if SYN is set (attacker initiating connections)
-            if is_syn:
-                self.detect_dos(dpid, ip_pkt.src)
 
             # Port scan detection also only if SYN:
             if is_syn and tcp_pkt:
@@ -298,42 +385,6 @@ class SimpleSwitch13REST(app_manager.RyuApp):
             # Mark as detected and block
             record["detected"] = True
             self.scan_tracker[src_ip] = record
-
-            self.blocked_hosts.add(src_ip)
-            if dpid in self.datapaths:
-                self.block_host(self.datapaths[dpid], src_ip)
-
-    def detect_dos(self, dpid, src_ip):
-        """
-        Detect DoS attacks based on SYN packet count in DOS_WINDOW.
-        Only SYN packets are counted to avoid labeling victims (responding with RST/ACK) as attackers.
-        """
-        now = time.time()
-        record = self.dos_tracker.get(src_ip, {"count": 0, "start_time": now, "detected": False})
-
-        # If already detected, return
-        if record["detected"]:
-            return
-
-        if now - record["start_time"] > self.DOS_WINDOW:
-            # Reset if window expired
-            record["count"] = 0
-            record["start_time"] = now
-
-        record["count"] += 1
-        self.dos_tracker[src_ip] = record
-
-        if record["count"] > self.DOS_THRESHOLD:
-            self.logger.warning("DoS attack detected from %s", src_ip)
-            self.dos_alert_count += 1
-            self.dos_events.append({
-                "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
-                "src_ip": src_ip
-            })
-
-            # Mark as detected
-            record["detected"] = True
-            self.dos_tracker[src_ip] = record
 
             self.blocked_hosts.add(src_ip)
             if dpid in self.datapaths:
